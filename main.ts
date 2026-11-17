@@ -61,6 +61,26 @@ let roundTrips = 0;
 /** Whether the previous batch showed a position (to count its close). */
 let wasHolding = false;
 
+/** Whether the dip is deep enough to buy on this batch's close. */
+function isDip(seq: number): boolean {
+  const now = closes[seq];
+  const then = seq >= LOOKBACK_BARS ? closes[seq - LOOKBACK_BARS] : null;
+  if (now === null || now === undefined || then === null || then === undefined) return false;
+  // now < then * (10000 - ENTRY_BPS) / 10000, exactly.
+  return now * BPS < then * (BPS - ENTRY_BPS);
+}
+
+/** Whether the held position should be sold whole on this batch's close. */
+function shouldExit(state: BarsState, held: { qty: bigint; cost: bigint }, seq: number): boolean {
+  const value = state.value(SYMBOL, held.qty);
+  // value >= cost * (10000 + TP_BPS) / 10000, exactly.
+  if (value * BPS >= held.cost * (BPS + TP_BPS)) return true;
+  // value <= cost * (10000 - SL_BPS) / 10000, exactly.
+  if (value * BPS <= held.cost * (BPS - SL_BPS)) return true;
+  if (heldSince !== null && seq - heldSince >= MAX_HOLD_BARS) return true;
+  return false;
+}
+
 await runBars({
   onBatch(state: BarsState, batch: Batch): OrderInput[] {
     for (const bar of batch.bars) closes[batch.seq] = BigInt(bar.c);
@@ -73,25 +93,16 @@ await runBars({
 
     if (!nowHolding) {
       if (roundTrips >= MAX_ROUND_TRIPS) return [];
-      const now = closes[batch.seq];
-      const then = batch.seq >= LOOKBACK_BARS ? closes[batch.seq - LOOKBACK_BARS] : null;
-      if (now === null || now === undefined || then === null || then === undefined) return [];
-      // now < then * (10000 - ENTRY_BPS) / 10000, exactly.
-      if (now * BPS < then * (BPS - ENTRY_BPS)) {
+      if (isDip(batch.seq)) {
         heldSince = batch.seq;
         return [{ side: "buy", symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       return [];
     }
 
-    const heldPos = held!;
-    const value = state.value(SYMBOL, heldPos.qty);
-    const sell: OrderInput[] = [{ side: "sell", symbol: SYMBOL, qty: heldPos.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
-    // value >= cost * (10000 + TP_BPS) / 10000, exactly.
-    if (value * BPS >= heldPos.cost * (BPS + TP_BPS)) return sell;
-    // value <= cost * (10000 - SL_BPS) / 10000, exactly.
-    if (value * BPS <= heldPos.cost * (BPS - SL_BPS)) return sell;
-    if (heldSince !== null && batch.seq - heldSince >= MAX_HOLD_BARS) return sell;
+    if (shouldExit(state, held!, batch.seq)) {
+      return [{ side: "sell", symbol: SYMBOL, qty: held!.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    }
     return [];
   },
 });
